@@ -1,12 +1,145 @@
-.devcontainer/devcontainer.json
-{
-    // Name this configuration
-    "name": "Codespace for Skills!",
-    "customizations": {
-        "vscode": {
-            "extensions": [
-                "GitHub.copilot"
-            ]
-        }
-    }
+#include <SoftwareSerial.h>
+
+// Hardware Serial kullanımı
+#define RTS_PIN 4  // RTS kontrol pini
+#define PARK_LAMP_DELAY 60000  // 60 saniye (60000 milisaniye)
+
+unsigned long parkLampStartTime = 0;  // Park lambası başlama zamanı
+bool parkLampsOn = false;
+bool windowsClosed = false;
+bool lockSignalReceived = false;
+
+unsigned long rtsCheckTime = 0;
+
+// Kontrol toplamı hesaplama
+uint8_t calculateChecksum(uint8_t *data, uint8_t length) {
+  uint8_t checksum = 0;
+  for (uint8_t i = 0; i < length - 1; i++) {
+    checksum ^= data[i];
+  }
+  return checksum;
 }
+
+// IBUS mesaj gönderme
+void sendIBUSMessage(uint8_t *message, uint8_t length) {
+  message[length - 1] = calculateChecksum(message, length);
+
+  // RTS kontrolü
+  while (digitalRead(RTS_PIN) == LOW) {
+    if (millis() - rtsCheckTime > 10) {
+      rtsCheckTime = millis();
+      break;
+    }
+  }
+
+  Serial.write(message, length);
+
+  // Debug: Mesajı ekrana yazdır
+  Serial.print("IBUS gönderilen mesaj: ");
+  for (uint8_t i = 0; i < length; i++) {
+    Serial.print("0x");
+    Serial.print(message[i], HEX);
+    Serial.print(" ");
+  }
+  Serial.println();
+}
+
+// Park lambalarını 60 saniye boyunca yak ve ardından söndür
+void handleParkLamps() {
+  if (parkLampsOn && millis() - parkLampStartTime >= PARK_LAMP_DELAY) {
+    // 60 saniye sonunda park lambalarını kapat
+    uint8_t parkLampOff[] = {0x00, 0x04, 0xBF, 0x72, 0x16, 0x00};  // Park lambası kapat komutu
+    Serial.println("Ön park lambaları kapatılıyor.");
+    sendIBUSMessage(parkLampOff, sizeof(parkLampOff));
+    parkLampsOn = false;
+  }
+}
+
+void turnOnParkLamps() {
+  uint8_t parkLampOn[] = {0x00, 0x04, 0xBF, 0x72, 0x26, 0x00};  // Park lambası aç komutu
+  Serial.println("Ön park lambaları yakılıyor.");
+  sendIBUSMessage(parkLampOn, sizeof(parkLampOn));
+
+  parkLampStartTime = millis();  // Zamanlayıcıyı başlat
+  parkLampsOn = true;
+}
+
+// Camları ve sunroofu kapat
+void closeAllWindowsAndSunroof() {
+  uint8_t commands[][6] = {
+    {0x3F, 0x05, 0x00, 0x0C, 0x42, 0x00}, // Sürücü cam kapat
+    {0x3F, 0x05, 0x00, 0x0C, 0x43, 0x00}, // Arka sağ cam kapat
+    {0x3F, 0x05, 0x00, 0x0C, 0x53, 0x00}, // Ön yolcu cam kapat
+    {0x3F, 0x05, 0x00, 0x0C, 0x55, 0x00}, // Arka sol cam kapat
+    {0x3F, 0x05, 0x00, 0x0C, 0x7F, 0x00}  // Sunroof kapat
+  };
+
+  Serial.println("Camlar ve sunroof kapatılıyor...");
+  for (uint8_t i = 0; i < 5; i++) {
+    sendIBUSMessage(commands[i], sizeof(commands[i]));
+    delay(100);  // Her komut arasında kısa bir bekleme süresi
+  }
+  windowsClosed = true;
+}
+
+// Gelen mesajı kontrol et
+bool checkRemoteUnlock(uint8_t *message, uint8_t length) {
+  uint8_t remoteHome[] = {0x00, 0x04, 0xBF, 0x72, 0x26};
+  if (length < 5) return false;
+
+  for (uint8_t i = 0; i < 5; i++) {
+    if (message[i] != remoteHome[i]) {
+      return false;
+    }
+  }
+  return true;
+}
+
+bool checkRemoteLock(uint8_t *message, uint8_t length) {
+  uint8_t remoteLock[] = {0x00, 0x04, 0xBF, 0x72, 0x16};
+  if (length < 5) return false;
+
+  for (uint8_t i = 0; i < 5; i++) {
+    if (message[i] != remoteLock[i]) {
+      return false;
+    }
+  }
+  return true;
+}
+
+void setup() {
+  pinMode(RTS_PIN, INPUT);
+  Serial.begin(9600);
+
+  Serial.println("IBUS Sistem Başlatıldı");
+}
+
+void loop() {
+  static uint8_t receivedData[32];
+  static uint8_t length = 0;
+
+  // Gelen IBUS mesajını oku
+  while (Serial.available()) {
+    receivedData[length++] = Serial.read();
+    if (length >= sizeof(receivedData)) break;
+  }
+
+  // Gelen mesaj uzunluğu yeterliyse kontrol et
+  if (length >= 5) {
+    if (checkRemoteUnlock(receivedData, length)) {
+      Serial.println("Uzaktan Kumanda Açma Sinyali Algılandı!");
+      turnOnParkLamps();
+    }
+
+    if (!windowsClosed && checkRemoteLock(receivedData, length)) {
+      Serial.println("Uzaktan Kumanda Kilitleme Sinyali Algılandı!");
+      closeAllWindowsAndSunroof();
+      lockSignalReceived = true;
+    }
+
+    length = 0;  // Mesaj kontrol edildikten sonra sıfırla
+  }
+
+  handleParkLamps();  // Park lambaları süresini kontrol et
+}
+
